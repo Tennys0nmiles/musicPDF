@@ -7,8 +7,23 @@ symbols and lyrics, plus a MuseScore file you can edit.
 ```
 ./transpose.py song.pdf 2            # -> song_+2.pdf and song_+2.mscz
 ./transpose.py song.pdf -3 -o out.pdf
+./transpose.py song.pdf -7 --audio both --speed 80   # + practice tracks (MP3)
 ./transpose.py --serve               # web page at http://localhost:8771
 ```
+
+## Practice tracks
+
+The transposed score can be played back as plain piano, in the new key:
+
+- **whole piece** (`--audio full`): every part — voice and accompaniment — on piano;
+- **main line** (`--audio main`): only the solo line above the accompaniment (a
+  song's vocal line, a violin over piano); for a single-part score, the top notes
+  of the upper staff.
+
+`--speed` sets the tempo in percent (e.g. 75 to practice slower). Tempo marks
+read from the page ("♩. = 80") and repeat counts ("Play 3 times") are honored;
+chord symbols are not played. On the web page, the result has a *Practice tracks*
+panel with both options, a speed box and a player.
 
 ## Setup
 

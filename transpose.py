@@ -9,9 +9,10 @@ had low confidence in) are printed in red and listed.
 
   ./transpose.py song.pdf 3          # up 3 semitones -> song_+3.pdf, song_+3.mscz
   ./transpose.py song.pdf -2 -o out.pdf
+  ./transpose.py song.pdf -7 --audio both   # + practice tracks: song_-7_full.mp3, song_-7_main.mp3
   ./transpose.py --serve             # web UI at http://localhost:8771
 """
-import argparse, base64, json, os, secrets, shutil, subprocess, sys, tempfile, threading, time
+import argparse, json, os, secrets, shutil, sys, tempfile, threading
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -22,10 +23,7 @@ if VENV_PY.exists() and Path(sys.prefix).resolve() != (HERE / ".venv").resolve()
     os.execv(VENV_PY, [str(VENV_PY), *sys.argv])  # run inside the project venv made by setup.sh
 sys.path.insert(0, str(HERE))
 import chords, fixup, omr  # noqa: E402
-
-MUSESCORE = HERE / "vendor/musescore/AppRun"
-STYLE = HERE / "style.mss"
-
+from engrave import musescore  # noqa: E402
 
 @dataclass
 class Result:
@@ -33,38 +31,8 @@ class Result:
     mscz: bytes
     flagged: list[int] = field(default_factory=list)  # bar numbers to check by eye
     chords: int = 0
-
-
-def target_key(fifths: int, semitones: int) -> int:
-    """Key signature (in fifths) after transposing, spelled with the fewest accidentals."""
-    pc = (fifths * 7 + semitones) % 12
-    options = [f for f in range(-7, 8) if (f * 7) % 12 == pc]
-    return min(options, key=lambda f: (abs(f), f > 0))
-
-
-def first_key(xml: Path) -> int:
-    fifths = ET.parse(xml).getroot().find(".//key/fifths")
-    return int(fifths.text) if fifths is not None else 0
-
-
-def musescore(xml: Path, semitones: int, out: Path) -> tuple[bytes, bytes]:
-    env = dict(os.environ, QT_QPA_PLATFORM="offscreen")
-    if semitones == 0:
-        pdf, mscz = out / "out.pdf", out / "out.mscz"
-        for target in (pdf, mscz):
-            subprocess.run([str(MUSESCORE), "-S", str(STYLE), "-o", str(target), str(xml)],
-                           env=env, check=True, capture_output=True)
-        return pdf.read_bytes(), mscz.read_bytes()
-    if abs(semitones) == 12:
-        opts = {"mode": "by_interval", "transposeInterval": 25}  # perfect octave
-    else:
-        opts = {"mode": "to_key", "targetKey": target_key(first_key(xml), semitones)}
-    opts.update(direction="up" if semitones > 0 else "down", transposeKeySignatures=True,
-                transposeChordNames=True, useDoubleSharpsFlats=False)
-    proc = subprocess.run([str(MUSESCORE), "-S", str(STYLE), str(xml), "--score-transpose", json.dumps(opts)],
-                          env=env, check=True, capture_output=True, text=True)
-    data = json.loads(proc.stdout[proc.stdout.index("{"):])
-    return base64.b64decode(data["pdf"]), base64.b64decode(data["mscz"])
+    xml: bytes = b""          # the repaired score before transposing (for practice tracks)
+    semitones: int = 0
 
 
 # Share of the whole run each stage takes (measured on an 8-page scanned song).
@@ -99,9 +67,11 @@ def transpose(src: Path, semitones: int, progress=None, keep: Path | None = None
             tree.write(xml, encoding="UTF-8", xml_declaration=True)
         stage("engrave")(0, "Transposing and engraving (MuseScore)")
         pdf, mscz = musescore(xml, semitones, tmp)
+        score_xml = ET.tostring(fixup.load_xml(xml).getroot() if xml.suffix.lower() == ".mxl"
+                                else ET.parse(xml).getroot(), encoding="UTF-8", xml_declaration=True)
     if progress:
         progress(1.0, "Done")
-    return Result(pdf, mscz, flagged, n)
+    return Result(pdf, mscz, flagged, n, score_xml, semitones)
 
 
 # ---------------------------------------------------------------- web UI
@@ -117,6 +87,11 @@ input,button{font:inherit;margin:.4rem 0;display:block}button{padding:.5rem 1rem
 .bar{height:14px;background:var(--track);border-radius:7px;overflow:hidden;margin:1.2rem 0 .4rem}
 #fill{height:100%;width:0;background:var(--fill);transition:width .6s ease}
 #pct{font-variant-numeric:tabular-nums;font-weight:600}
+.tracks{border-top:1px solid var(--track);margin-top:1rem;padding-top:.6rem}
+.tracks .row{display:flex;gap:.5rem;align-items:center;flex-wrap:wrap}
+.tracks .row button,.tracks .row input{margin:.2rem 0}
+.tracks input[type=number]{width:5rem}
+audio{width:100%;margin:.4rem 0}
 </style>
 <h2>Transpose sheet music</h2>
 <form id=f>
@@ -151,12 +126,34 @@ $('f').onsubmit = async e => {
     } else if (s.done) {
       const bars = s.flagged.length ? '<p class=warn>Check bar' + (s.flagged.length > 1 ? 's ' : ' ') + s.flagged.join(', ') + ' (in red).</p>' : '';
       $('out').innerHTML = '<p><b>Done</b> in ' + Math.round(sec) + ' s: ' + esc(s.name) + ', ' + s.chords + ' chord symbols.</p>' + bars +
-        '<p><a href="/' + job + '/pdf" target=_blank>Open transposed PDF</a> &middot; <a href="/' + job + '/mscz">MuseScore file</a></p>';
+        '<p><a href="/' + job + '/pdf" target=_blank>Open transposed PDF</a> &middot; <a href="/' + job + '/mscz">MuseScore file</a></p>' +
+        '<div class=tracks><b>Practice tracks</b> <span class=note>(plain piano, in the new key)</span>' +
+        '<div class=row><label>Speed <input type=number id=speed value=100 min=10 max=300 step=5>%</label>' +
+        '<button data-mode=full>Whole piece</button><button data-mode=main>Main line only</button></div>' +
+        '<div id=players></div></div>';
+      document.querySelectorAll('[data-mode]').forEach(btn => btn.onclick = () => track(job, btn.dataset.mode));
       $('b').disabled = false;
     } else setTimeout(poll, 1000);
   };
   poll();
 };
+async function track(job, mode) {
+  const speed = Math.round(Number($('speed').value) || 100);
+  const label = (mode === 'full' ? 'Whole piece' : 'Main line') + (speed !== 100 ? ' at ' + speed + '%' : '');
+  const key = mode + '-' + speed, id = 'p-' + key;
+  if (!$(id)) $('players').insertAdjacentHTML('afterbegin', '<div id="' + id + '"></div>');
+  $(id).innerHTML = '<p class=note>' + label + ': rendering...</p>';
+  const body = new FormData(); body.append('mode', mode); body.append('speed', speed);
+  await fetch('/audio/' + job, {method: 'POST', body});
+  const poll = async () => {
+    const a = ((await (await fetch('/status/' + job)).json()).audio || {})[key];
+    if (!a || a.state === 'working' || a.state === 'queued') return setTimeout(poll, 1000);
+    if (a.state === 'error') { $(id).innerHTML = '<p class=warn>' + label + ' failed: ' + esc(a.error) + '</p>'; return; }
+    const url = '/' + job + '/audio/' + key + '.mp3';
+    $(id).innerHTML = '<p>' + label + ' <a href="' + url + '?download=1">download MP3</a></p><audio controls src="' + url + '"></audio>';
+  };
+  poll();
+}
 </script>"""
 
 
@@ -166,6 +163,17 @@ def serve(port: int):
     from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
     jobs: dict[str, dict] = {}
     one_at_a_time = threading.Lock()  # a run is a heavy job; never stack two
+
+    def run_audio(job: dict, key: str, mode: str, speed: float):
+        import audio
+        job["audio"][key] = {"state": "queued"}
+        try:
+            with one_at_a_time:
+                job["audio"][key] = {"state": "working"}
+                data = audio.render(job["result"].xml, job["result"].semitones, mode, "mp3", speed)
+            job["audio"][key] = {"state": "ready", "data": data}
+        except Exception as e:
+            job["audio"][key] = {"state": "error", "error": str(e) or type(e).__name__}
 
     def run(job: dict, src: Path, n: int):
         def progress(f, msg):
@@ -196,8 +204,15 @@ def serve(port: int):
                 r = j.get("result")
                 status = {k: j[k] for k in ("pct", "msg", "name")} | {
                     "done": j["done"] and r is not None, "error": j.get("error"),
-                    "flagged": r.flagged if r else [], "chords": r.chords if r else 0}
+                    "flagged": r.flagged if r else [], "chords": r.chords if r else 0,
+                    "audio": {k: {"state": a["state"], "error": a.get("error")} for k, a in j["audio"].items()}}
                 self._send(json.dumps(status).encode(), "application/json")
+            elif (len(path) == 3 and path[0] in jobs and path[1] == "audio"
+                  and jobs[path[0]]["audio"].get(path[2].split("?")[0].removesuffix(".mp3"), {}).get("state") == "ready"):
+                key = path[2].split("?")[0].removesuffix(".mp3")
+                disp = "attachment" if "download=1" in path[2] else "inline"
+                self._send(jobs[path[0]]["audio"][key]["data"], "audio/mpeg",
+                           [("Content-Disposition", f'{disp}; filename="{jobs[path[0]]["name"]}_{key}.mp3"')])
             elif len(path) == 2 and path[0] in jobs and path[1] in ("pdf", "mscz") and jobs[path[0]].get("result"):
                 j = jobs[path[0]]
                 ctype = "application/pdf" if path[1] == "pdf" else "application/octet-stream"
@@ -212,12 +227,21 @@ def serve(port: int):
             msg = BytesParser(policy=HTTP).parsebytes(
                 b"Content-Type: " + self.headers["Content-Type"].encode() + b"\r\n\r\n" + body)
             fields = {p.get_param("name", header="content-disposition"): p for p in msg.iter_parts()}
+            path = self.path.strip("/").split("/")
+            if len(path) == 2 and path[0] == "audio" and path[1] in jobs and jobs[path[1]].get("result"):
+                mode = fields["mode"].get_content().strip()
+                speed = float(fields["speed"].get_content().strip() or 100)
+                key = f"{mode}-{speed:g}"
+                if jobs[path[1]]["audio"].get(key, {}).get("state") not in ("queued", "working", "ready"):
+                    threading.Thread(target=run_audio, args=(jobs[path[1]], key, mode, speed), daemon=True).start()
+                self._send(json.dumps({"key": key}).encode(), "application/json")
+                return
             f, n = fields["file"], int(fields["semitones"].get_content().strip() or 0)
             name = Path(f.get_filename() or "score.pdf")
             src = Path(tempfile.mkdtemp(prefix="transposer-")) / f"in{name.suffix.lower()}"
             src.write_bytes(f.get_payload(decode=True))
             token = secrets.token_urlsafe(8)
-            jobs[token] = {"pct": 0.0, "msg": "Starting", "name": f"{name.stem}_{n:+d}", "done": False}
+            jobs[token] = {"pct": 0.0, "msg": "Starting", "name": f"{name.stem}_{n:+d}", "done": False, "audio": {}}
             threading.Thread(target=run, args=(jobs[token], src, n), daemon=True).start()
             self._send(json.dumps({"job": token}).encode(), "application/json")
 
@@ -247,6 +271,9 @@ if __name__ == "__main__":
     ap.add_argument("--serve", action="store_true")
     ap.add_argument("--port", type=int, default=8771)
     ap.add_argument("--keep", type=Path, metavar="DIR", help="keep intermediate files (incl. score.musicxml) in DIR")
+    ap.add_argument("--audio", choices=("full", "main", "both"),
+                    help="also write practice tracks (plain piano MP3): the whole piece, the main line, or both")
+    ap.add_argument("--speed", type=float, default=100, metavar="PCT", help="practice track speed in percent (default 100)")
     a = ap.parse_args()
     if a.serve:
         serve(a.port)
@@ -261,3 +288,9 @@ if __name__ == "__main__":
         print(f"{out}  (+ {out.with_suffix('.mscz').name}, {r.chords} chord symbols)")
         if r.flagged:
             print(f"Check bars {', '.join(map(str, r.flagged))} (printed in red): the reader was unsure of them.")
+        if a.audio:
+            import audio
+            for mode in ("full", "main") if a.audio == "both" else (a.audio,):
+                track = out.with_name(f"{out.stem}_{mode}{'' if a.speed == 100 else f'_{a.speed:g}pct'}.mp3")
+                track.write_bytes(audio.render(r.xml, r.semitones, mode, "mp3", a.speed))
+                print(track)

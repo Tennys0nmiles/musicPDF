@@ -44,6 +44,8 @@ def fix(book: Book, chords: list[Chord]) -> tuple[ET.ElementTree, list[int]]:
     _drop_text_dynamics(score)
     _drop_symbols_in_text(score, book)
     _reread_directions(score, book)
+    _add_tempo(score, book)
+    _repeat_counts(score)
     used = _fix_glued_accidentals(score, book)
     octaves.apply(score, book, octaves.find(book),
                   lambda system, k: system.staff_parts[k] if k < len(system.staff_parts) else None)
@@ -519,6 +521,82 @@ def _reread_directions(score: ET.Element, book: Book):
                 if (len(new.split()) >= len(old.split())
                         and difflib.SequenceMatcher(None, new.lower(), old.lower()).ratio() >= 0.6):
                     w.text = new
+
+
+def _add_tempo(score: ET.Element, book: Book):
+    """Turn a tempo text ("a tempo = 80", the note glyph lost to OCR) into a metronome mark
+    that MuseScore shows and plays. In compound meter (6/8...) the beat is a dotted quarter."""
+    parts = score.findall("part")
+    if not parts:
+        return
+    measures = parts[0].findall("measure")
+    marks = []
+    for t in book.texts:
+        mt = re.search(r"=\s*(\d{2,3})\b", t.text)
+        if not mt or not 30 <= int(mt.group(1)) <= 260:
+            continue
+        # Text between two systems belongs to the one below it.
+        below = [s for s in book.systems if s.sheet == t.sheet and s.staves[0][0] > t.box[1] + t.box[3]]
+        if not below:
+            continue
+        system = min(below, key=lambda s: s.staves[0][0])
+        cx = t.box[0] + t.box[2] / 2
+        stack = next((st for st in system.stacks if st.left <= cx < st.right), system.stacks[0])
+        marks.append((stack.measure, int(mt.group(1))))
+    state = {"div": 1, "time": Fraction(3, 4)}
+    meters = []
+    for m in measures:
+        _measure_len(m, state)
+        meters.append(state.get("meter", (3, 4)))
+    for mi, bpm in sorted(set(marks)):
+        if mi >= len(measures):
+            continue
+        beats, unit = meters[mi]
+        dotted = unit == 8 and beats % 3 == 0
+        d = ET.Element("direction", {"placement": "above"})
+        met = ET.SubElement(ET.SubElement(d, "direction-type"), "metronome")
+        ET.SubElement(met, "beat-unit").text = "quarter"
+        if dotted:
+            ET.SubElement(met, "beat-unit-dot")
+        ET.SubElement(met, "per-minute").text = str(bpm)
+        ET.SubElement(d, "sound", {"tempo": str(round(bpm * (1.5 if dotted else 1), 2))})
+        m = measures[mi]
+        first = next((i for i, c in enumerate(m) if c.tag in ("note", "harmony", "direction")), len(m))
+        m.insert(first, d)
+    if marks and min(marks)[0] > 0:
+        # Before the first mark, play at that tempo too, not MuseScore's default 120.
+        mi, bpm = min(marks)
+        beats, unit = meters[mi]
+        tempo = bpm * (1.5 if unit == 8 and beats % 3 == 0 else 1)
+        d = ET.Element("direction")
+        ET.SubElement(ET.SubElement(d, "direction-type"), "words").text = ""
+        ET.SubElement(d, "sound", {"tempo": str(round(tempo, 2))})
+        m0 = measures[0]
+        m0.insert(next((i for i, c in enumerate(m0) if c.tag in ("note", "harmony", "direction")), len(m0)), d)
+
+
+def _repeat_counts(score: ET.Element):
+    """"Play 3 times" before a repeat sign: make the repeat play that many times."""
+    parts = score.findall("part")
+    if not parts:
+        return
+    measures = parts[0].findall("measure")
+    for mi, m in enumerate(measures):
+        for w in m.iter("words"):
+            mt = re.search(r"(?:play|repeat)\s+(\d+)\s*(?:x|times)|(\d+)\s*x\b", w.text or "", re.I)
+            if not mt:
+                continue
+            times = mt.group(1) or mt.group(2)
+            end = next((k for k in range(mi, len(measures))
+                        if measures[k].find(".//repeat[@direction='backward']") is not None), None)
+            if end is None:
+                continue
+            for p in parts:
+                pm = p.findall("measure")
+                if end < len(pm):
+                    for r in pm[end].iter("repeat"):
+                        if r.get("direction") == "backward":
+                            r.set("times", times)
 
 
 def _is_chordlike(text: str) -> bool:
