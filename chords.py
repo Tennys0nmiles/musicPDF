@@ -276,7 +276,7 @@ def _read_words(book: Book) -> list[_Word]:
     for system in book.systems:
         words += _words(book.pages[system.sheet - 1], system, prev)
         prev = system
-    with tempfile.TemporaryDirectory() as tmp, ThreadPoolExecutor(os.cpu_count() or 4) as ex:
+    with tempfile.TemporaryDirectory() as tmp, ThreadPoolExecutor(min(os.cpu_count() or 4, 4)) as ex:  # each Tesseract ~100 MB
         list(ex.map(lambda nw: _ocr(nw[1], Path(tmp), nw[0]), enumerate(words)))
     return words
 

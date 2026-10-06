@@ -25,6 +25,8 @@ if [ ! -x vendor/audiveris/opt/audiveris/bin/Audiveris ]; then
   else  # a .deb is an ar archive holding data.tar.*
     (cd vendor/download && ar x audiveris.deb) && tar -xf vendor/download/data.tar.* -C vendor/audiveris
   fi
+  # Audiveris ships with an 8 GB Java heap; 2 GB is plenty for a song and leaves room on 16 GB machines.
+  sed -i 's/^java-options=-Xmx.*/java-options=-Xmx2G/' vendor/audiveris/opt/audiveris/lib/app/Audiveris.cfg
 fi
 
 if [ ! -x vendor/musescore/AppRun ]; then
