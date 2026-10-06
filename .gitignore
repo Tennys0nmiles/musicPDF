@@ -1,0 +1,12 @@
+# Downloaded by setup.sh
+vendor/
+.venv/
+
+__pycache__/
+
+# Scores and results stay local (input PDFs are usually copyrighted)
+samples/
+*.pdf
+*.mscz
+*.mxl
+*.musicxml
