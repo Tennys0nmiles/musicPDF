@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Download the tools transposer drives (about 400 MB of downloads, 800 MB unpacked)
+# Download the tools musicPDF drives (about 400 MB of downloads, 800 MB unpacked)
 # into ./vendor and make a Python venv. Linux x86_64; tested on Ubuntu 24.04.
 # Safe to re-run: finished steps are skipped.
 set -euo pipefail
@@ -71,4 +71,4 @@ fi
 
 rm -rf vendor/download
 [ -e /usr/share/dict/words ] || echo "note: no /usr/share/dict/words; lyric spell-check will be skipped (sudo apt install wamerican)"
-echo "Done. Try: ./transpose.py your-score.pdf 2    or    ./transpose.py --serve"
+echo "Done. Try: ./musicpdf.py your-score.pdf --key Am --track both    or    ./musicpdf.py --serve"

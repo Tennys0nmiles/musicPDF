@@ -137,14 +137,16 @@ def playback_score(xml: bytes, mode: str, speed: float = 100) -> bytes:
     return ET.tostring(score, encoding="UTF-8", xml_declaration=True)
 
 
-def render(xml: bytes, semitones: int, mode: str, fmt: str = "mp3", speed: float = 100) -> bytes:
-    """Transpose the playback copy like the PDF and render it with MuseScore."""
+def render(xml: bytes, semitones: int, mode: str, fmt: str = "mp3", speed: float = 100,
+           key: int | None = None) -> bytes:
+    """Transpose the playback copy like the PDF (into key signature `key` if given) and
+    render it with MuseScore."""
     with tempfile.TemporaryDirectory() as tmp:
         tmp = Path(tmp)
         src = tmp / "playback.musicxml"
         src.write_bytes(playback_score(xml, mode, speed))
-        if semitones:
-            _, mscz = engrave.musescore(src, semitones, tmp)
+        if semitones or key is not None:
+            _, mscz = engrave.musescore(src, semitones, tmp, key)
             src = tmp / "playback.mscz"
             src.write_bytes(mscz)
         out = tmp / f"track.{fmt}"

@@ -1,29 +1,44 @@
-# transposition
+# musicPDF
 
-Transpose sheet music from a PDF by any number of semitones. Drop in a PDF,
-pick +2 or -3, and get back a newly engraved PDF in the new key, with chord
-symbols and lyrics, plus a MuseScore file you can edit.
+Put in a sheet-music PDF and choose what to make from it:
+
+- **Transpose**: a newly engraved PDF in another key (with chord symbols and
+  lyrics), plus a MuseScore file you can edit. Pick the key, or a number of
+  semitones.
+- **Practice tracks**: plain-piano MP3s of the whole piece or just its main line
+  (the vocal or solo part), at any speed.
+- or **both**: the tracks are then in the new key.
 
 ```
-./transpose.py song.pdf 2            # -> song_+2.pdf and song_+2.mscz
-./transpose.py song.pdf -3 -o out.pdf
-./transpose.py song.pdf -7 --audio both --speed 80   # + practice tracks (MP3)
-./transpose.py --serve               # web page at http://localhost:8771
+./musicpdf.py song.pdf --key Am --direction down    # -> song_-7.pdf, song_-7.mscz
+./musicpdf.py song.pdf --semitones 3                # -> song_+3.pdf
+./musicpdf.py song.pdf --track both --speed 80      # -> song_full_80pct.mp3, song_main_80pct.mp3
+./musicpdf.py song.pdf --key Bb --track main        # transposed PDF + its main-line track
+./musicpdf.py --serve                               # web page at http://localhost:8771
 ```
+
+## Transposing
+
+`--key` takes a key name: `Am`, `Bb`, `F# major`, `E♭ minor`. Relative major and
+minor keys share a key signature, so `Am` and `C` give the same result; the web
+page lists keys as pairs ("C major / A minor"). `--direction` picks whether the
+music moves `up`, `down`, or whichever is `closest` (default). Or give
+`--semitones N` (-12..12) instead. The new key is spelled with the fewest sharps
+or flats.
 
 ## Practice tracks
 
-The transposed score can be played back as plain piano, in the new key:
+The score is played back as plain piano (`--track full|main|both`):
 
-- **whole piece** (`--audio full`): every part — voice and accompaniment — on piano;
-- **main line** (`--audio main`): only the solo line above the accompaniment (a
-  song's vocal line, a violin over piano); for a single-part score, the top notes
-  of the upper staff.
+- **whole piece** (`full`): every part, voice and accompaniment, on piano;
+- **main line** (`main`): only the solo line above the accompaniment (a song's
+  vocal line, a violin over piano); for a single-part score, the top notes of the
+  upper staff.
 
 `--speed` sets the tempo in percent (e.g. 75 to practice slower). Tempo marks
 read from the page ("♩. = 80") and repeat counts ("Play 3 times") are honored;
-chord symbols are not played. On the web page, the result has a *Practice tracks*
-panel with both options, a speed box and a player.
+chord symbols are not played. On the web page, the result also has buttons to
+make more tracks at other speeds, with a player.
 
 ## Setup
 
@@ -31,8 +46,8 @@ Linux x86_64 (tested on Ubuntu 24.04). Needs `python3` (with venv), `curl`,
 `unzip` and `pdftoppm` (`sudo apt install python3-venv curl unzip poppler-utils`).
 
 ```
-git clone https://github.com/Tennys0nmiles/transposition.git
-cd transposition
+git clone https://github.com/Tennys0nmiles/musicPDF.git
+cd musicPDF
 ./setup.sh
 ```
 
@@ -71,8 +86,11 @@ Python venv:
      page ("mme" → "mine"), and words Audiveris missed recovered from the line;
    - "dynamics" and tuplet numbers that are really letters of nearby text dropped,
      and text directions re-read.
-5. **Transpose and engrave** with MuseScore, picking the key signature with the
-   fewest sharps/flats.
+5. **Transpose and engrave** with MuseScore (`engrave.py`), picking the key
+   signature with the fewest sharps/flats.
+6. **Practice tracks** (`audio.py`): a playback copy of the score with every part
+   on piano and no chord-symbol playback (optionally only the main line) is
+   transposed the same way and rendered to MP3 with MuseScore's built-in sounds.
 
 ## Accuracy
 
