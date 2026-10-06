@@ -4,7 +4,8 @@
 PDF -> erase guitar chord diagrams -> Audiveris (OMR) -> chord-symbol OCR ->
 MusicXML repairs -> MuseScore (transpose + engrave) -> PDF (+ editable .mscz).
 
-Bars whose rhythm still doesn't add up after repair are printed in red and listed.
+Bars the reader was unsure of (rhythm that doesn't add up, or notes Audiveris itself
+had low confidence in) are printed in red and listed.
 
   ./transpose.py song.pdf 3          # up 3 semitones -> song_+3.pdf, song_+3.mscz
   ./transpose.py song.pdf -2 -o out.pdf
@@ -70,8 +71,10 @@ def musescore(xml: Path, semitones: int, out: Path) -> tuple[bytes, bytes]:
 STAGES = {"prepare": (0.00, 0.03), "omr": (0.03, 0.78), "chords": (0.78, 0.94), "engrave": (0.94, 1.00)}
 
 
-def transpose(src: Path, semitones: int, progress=None) -> Result:
-    """`progress(fraction, message)` reports how far along the whole run is (0..1)."""
+def transpose(src: Path, semitones: int, progress=None, keep: Path | None = None) -> Result:
+    """`progress(fraction, message)` reports how far along the whole run is (0..1).
+    `keep`: folder to save intermediate files in (page images, Audiveris output,
+    the repaired untransposed score.musicxml) for inspection or hand correction."""
     if not -12 <= semitones <= 12:
         raise ValueError("semitones must be between -12 and 12")
 
@@ -81,6 +84,9 @@ def transpose(src: Path, semitones: int, progress=None) -> Result:
 
     with tempfile.TemporaryDirectory() as tmp:
         tmp = Path(tmp)
+        if keep:
+            keep.mkdir(parents=True, exist_ok=True)
+            tmp = keep
         if src.suffix.lower() in (".mxl", ".musicxml", ".xml"):
             xml, flagged, n = src, [], 0
         else:
@@ -240,6 +246,7 @@ if __name__ == "__main__":
     ap.add_argument("-o", "--output", type=Path, help="output PDF (default: <input>_<+n>.pdf)")
     ap.add_argument("--serve", action="store_true")
     ap.add_argument("--port", type=int, default=8771)
+    ap.add_argument("--keep", type=Path, metavar="DIR", help="keep intermediate files (incl. score.musicxml) in DIR")
     a = ap.parse_args()
     if a.serve:
         serve(a.port)
@@ -247,10 +254,10 @@ if __name__ == "__main__":
         ap.error("give an input file or --serve")
     else:
         out = a.output or a.input.with_name(f"{a.input.stem}_{a.semitones:+d}.pdf")
-        r = transpose(a.input, a.semitones, text_bar)
+        r = transpose(a.input, a.semitones, text_bar, a.keep)
         out.parent.mkdir(parents=True, exist_ok=True)
         out.write_bytes(r.pdf)
         out.with_suffix(".mscz").write_bytes(r.mscz)
         print(f"{out}  (+ {out.with_suffix('.mscz').name}, {r.chords} chord symbols)")
         if r.flagged:
-            print(f"Check bars {', '.join(map(str, r.flagged))}: their rhythm didn't add up (printed in red).")
+            print(f"Check bars {', '.join(map(str, r.flagged))} (printed in red): the reader was unsure of them.")

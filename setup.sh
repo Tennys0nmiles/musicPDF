@@ -70,4 +70,5 @@ fi
 .venv/bin/pip install -q -r requirements.txt
 
 rm -rf vendor/download
+[ -e /usr/share/dict/words ] || echo "note: no /usr/share/dict/words; lyric spell-check will be skipped (sudo apt install wamerican)"
 echo "Done. Try: ./transpose.py your-score.pdf 2    or    ./transpose.py --serve"

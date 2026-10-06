@@ -42,21 +42,38 @@ Python venv:
    sharps, flats or superscripts (F♯m/C♯, B♭7♭9, Cmaj⁷), so the strip above each
    vocal line is OCR'd separately: superscripts are enlarged, each name is read
    8 ways, and identical-looking names across the piece pool their readings.
-4. **Repair the MusicXML** (`fixup.py`): restore the chord symbols, turn
-   hyphens that were really held-syllable lines ("high,\_\_\_") back into
-   extenders, rebuild quadruplets in 6/8, drop "dynamics" that were misread
-   lyric letters, and clean up the title.
+4. **Repair the MusicXML** (`fixup.py`, `lyrics.py`, `octaves.py`):
+   - chord symbols restored;
+   - an accidental touching its note, which Audiveris reads as an extra
+     notehead (D♭ → a C+D chord), turned back into the accidental;
+   - rhythm: quadruplets in 6/8, invented triplets (the "3" of "Play 3 times"),
+     lost or extra dots, whole-bar rests — each applied only when it makes the
+     bar add up exactly;
+   - octave (8va / "(8)") lines found on the page and applied to the notes
+     under them;
+   - lyrics: held-syllable lines vs hyphens told apart by height, junk removed
+     (dashed lines read as text), words not in the dictionary re-read from the
+     page ("mme" → "mine"), and words Audiveris missed recovered from the line;
+   - "dynamics" and tuplet numbers that are really letters of nearby text dropped,
+     and text directions re-read.
 5. **Transpose and engrave** with MuseScore, picking the key signature with the
    fewest sharps/flats.
 
 ## Accuracy
 
 Optical music recognition is not perfect, so check the output against the
-original. Any bar whose rhythm still doesn't add up is **printed in red** and
-listed when the run finishes. Fix those in the `.mscz` file (open it in MuseScore).
+original. Bars the reader was unsure of are **printed in red** and listed when
+the run finishes: their rhythm doesn't add up, or Audiveris itself had low
+confidence in their noteheads. Fix those in the `.mscz` file (open it in
+MuseScore), or use `--keep DIR` to get the repaired, untransposed
+`score.musicxml` to edit.
 
-Known weak spots: notes far above the staff on many ledger lines, octave (8va)
-lines, and lyrics that run into other markings. Clean printed scores work best;
-phone photos and handwriting won't.
+Known weak spot: small cue-size notes far above the staff on many ledger lines
+(e.g. a brass line written into the vocal staff) — Audiveris misreads them; they
+are flagged red. Clean printed scores work best; phone photos and handwriting
+won't.
+
+The lyric spell-check uses the system word list (`/usr/share/dict/words`; on
+Ubuntu `sudo apt install wamerican`); without one that step is skipped.
 
 A full run takes roughly 20 seconds per page.

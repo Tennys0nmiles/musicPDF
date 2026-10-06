@@ -1,20 +1,29 @@
 """Repair Audiveris MusicXML before engraving.
 
 - chord symbols: replace Audiveris' few <harmony> with the ones read by chords.py
-- lyrics: a melisma line after "high,___" is an extender, not a hyphen
-- rhythm: quadruplets in compound meter (4 eighths in a dotted quarter), whose "4" Audiveris ignores
+- lyrics: see lyrics.py (extenders, junk, misread words)
+- notes: an accidental touching its note is sometimes read as a second notehead
+- rhythm: quadruplets in compound meter whose "4" Audiveris ignores, false triplets
+  (a "3" from nearby text), lost or extra augmentation dots, whole-bar rests
+- octave lines (8va): see octaves.py
 - dynamics that are really misread text (lyric letters, chord names) are dropped
-- flag measures whose voices still don't add up (colored red, reported back)
+- flag measures whose voices still don't add up, or whose notes Audiveris was
+  unsure of (colored red, reported back)
 """
 import difflib, re, unicodedata, zipfile
 import xml.etree.ElementTree as ET
 from fractions import Fraction
 
+import numpy as np
+from scipy import ndimage
+
+import lyrics, octaves
 from chords import Chord, CHORD_RE
-from omr import Book
+from omr import Book, Head
 
 FLAG_COLOR = "#E0201B"
 SCALE = 4  # durations are multiplied so quadruplet eighths stay integral
+LOW_GRADE = 0.35  # Audiveris' own confidence in a notehead below which it is likely wrong
 
 
 def load_xml(mxl) -> ET.ElementTree:
@@ -31,18 +40,26 @@ def fix(book: Book, chords: list[Chord]) -> tuple[ET.ElementTree, list[int]]:
     _scale_durations(score)
     _fix_text(score)
     _fix_credits(score)
-    _fix_extenders(score, book)
+    lyrics.fix(score, book)
     _drop_text_dynamics(score)
+    _drop_symbols_in_text(score, book)
+    _reread_directions(score, book)
+    used = _fix_glued_accidentals(score, book)
+    octaves.apply(score, book, octaves.find(book),
+                  lambda system, k: system.staff_parts[k] if k < len(system.staff_parts) else None)
     for part in score.findall("part"):
         state = {"div": 1, "time": Fraction(3, 4)}
         for m in part.findall("measure"):
-            _repair_tuplets(m, _measure_len(m, state), state.get("meter", (3, 4)))
+            expected = _measure_len(m, state)
+            _repair_tuplets(m, expected, state.get("meter", (3, 4)))
+            _repair_rhythm(m, expected)
     _set_harmony(score, chords)
+    unsure = _unsure_measures(book, used)
     flagged = set()
-    for part in score.findall("part"):
+    for pi, part in enumerate(score.findall("part")):
         state = {"div": 1, "time": Fraction(3, 4)}
         for i, m in enumerate(part.findall("measure")):
-            if _flag(m, _measure_len(m, state)):
+            if _flag(m, _measure_len(m, state), (pi, i) in unsure):
                 flagged.add(i + 1)
     return tree, sorted(flagged)
 
@@ -108,7 +125,7 @@ def _repair_tuplets(m: ET.Element, expected: int, meter: tuple[int, int]):
                     and all(n.find("time-modification") is None for n in group)
                     and group[0].findtext("beam") == "begin" and group[-1].findtext("beam") == "end"):
                 _make_tuplet(m, group, 4, 3)  # 4 notes in the time of 3: saves one note value
-                _shrink_backup_after(m, group[-1], dur)
+                _grow_backup_after(m, group[-1], -dur)
                 excess -= dur
                 i += 4
             else:
@@ -145,25 +162,241 @@ def _make_tuplet(m: ET.Element, group: list[ET.Element], actual: int, normal: in
                       else {"type": kind})
 
 
-def _shrink_backup_after(m: ET.Element, last: ET.Element, amount: int):
-    """The voice got shorter; the <backup> that rewinds to the measure start must too."""
+def _grow_backup_after(m: ET.Element, last: ET.Element, delta: int):
+    """A voice changed length by `delta`; the <backup> that rewinds to the measure start must too."""
     children = list(m)
     for el in children[children.index(last) + 1:]:
         if el.tag == "backup":
             d = el.find("duration")
-            d.text = str(int(d.text) - amount)
+            d.text = str(int(d.text) + delta)
             return
         if el.tag == "forward":
             return
 
 
+def _chord_of(m: ET.Element, note: ET.Element) -> list[ET.Element]:
+    """The note plus the chord tones stacked on it (following notes marked <chord/>)."""
+    children = list(m)
+    out = [note]
+    for el in children[children.index(note) + 1:]:
+        if el.tag == "note" and el.find("chord") is not None:
+            out.append(el)
+        else:
+            break
+    return out
+
+
+def _insert_after(n: ET.Element, el: ET.Element, tags: tuple[str, ...]):
+    """Insert el right after the last child of n whose tag is in tags (MusicXML order matters)."""
+    pos = [i for i, c in enumerate(n) if c.tag in tags]
+    n.insert(pos[-1] + 1 if pos else len(n), el)
+
+
+def _repair_rhythm(m: ET.Element, expected: int):
+    """Small fixes that make a voice fill its bar exactly; each applied only when it is
+    the single change that does so."""
+    for notes in _voices(m).values():
+        total = _voice_end(notes)
+        if total == expected:
+            continue
+        last = notes[-1][1]
+        # A whole-bar rest keeps the bar length Audiveris guessed before other repairs.
+        rest = last.find("rest")
+        if len(notes) == 1 and rest is not None and (rest.get("measure") == "yes"
+                                                     or last.findtext("type") in (None, "whole")):
+            last.find("duration").text = str(expected)
+            _grow_backup_after(m, last, expected - total)
+            continue
+        if total < expected:
+            # A tuplet mark Audiveris invented (e.g. the "3" of "Play 3 times").
+            group, groups = [], []
+            for _, n in notes:
+                tm = n.find("time-modification")
+                if tm is not None:
+                    group.append(n)
+                if group and (tm is None or n.find(".//tuplet[@type='stop']") is not None):
+                    groups.append(group)
+                    group = []
+            for g in groups + ([group] if group else []):
+                tm = g[0].find("time-modification")
+                actual, normal = int(tm.findtext("actual-notes")), int(tm.findtext("normal-notes"))
+                gain = sum(int(n.findtext("duration")) * (actual - normal) // normal for n in g)
+                if total + gain == expected:
+                    for n in g:
+                        for c in _chord_of(m, n):
+                            d = c.find("duration")
+                            d.text = str(int(d.text) * actual // normal)
+                            c.remove(c.find("time-modification"))
+                            for nots in c.findall("notations"):
+                                for t in nots.findall("tuplet"):
+                                    nots.remove(t)
+                                if len(nots) == 0:
+                                    c.remove(nots)
+                    _grow_backup_after(m, last, gain)
+                    total += gain
+                    break
+        if total != expected:
+            # A lost or extra augmentation dot (dot = +half the note's value).
+            diff = expected - total
+            if diff > 0:
+                cands = [n for _, n in notes if not n.findall("dot") and n.find("time-modification") is None
+                         and int(n.findtext("duration")) == 2 * diff]
+            else:
+                cands = [n for _, n in notes if len(n.findall("dot")) == 1
+                         and int(n.findtext("duration")) == -3 * diff]
+            if len(cands) == 1:
+                for c in _chord_of(m, cands[0]):
+                    d = c.find("duration")
+                    d.text = str(int(d.text) + diff)
+                    if diff > 0:
+                        _insert_after(c, ET.Element("dot"), ("type", "dot"))
+                    else:
+                        c.remove(c.find("dot"))
+                _grow_backup_after(m, last, diff)
+
+
+# ------------------------------------------------------------------ notes
+
+def _clef_steps(part: ET.Element, measure: int) -> dict[int, int]:
+    """Staff number -> diatonic step number (octave*7 + step) of the staff's middle line."""
+    clefs = {}
+    for m in part.findall("measure")[:measure + 1]:
+        for c in m.iter("clef"):
+            clefs[int(c.get("number", "1"))] = (c.findtext("sign"), int(c.findtext("line", "2")),
+                                                 int(c.findtext("clef-octave-change", "0")))
+    out = {}
+    for staff, (sign, line, octv) in clefs.items():
+        ref = {"G": 4 * 7 + 4, "F": 3 * 7 + 3, "C": 4 * 7 + 0}.get(sign)  # G4, F3, C4 sit on `line`
+        if ref is not None:
+            out[staff] = ref + 2 * (3 - line) + 7 * octv
+    return out
+
+
+def _step_number(note: ET.Element) -> int | None:
+    p = note.find("pitch")
+    if p is None:
+        return None
+    return int(p.findtext("octave")) * 7 + STEPS.index(p.findtext("step"))
+
+
+def _accidental_glyph(page: np.ndarray, low: Head, high: Head) -> str | None:
+    """What a 'notehead' glued to the left of a real note actually is: flat, sharp or natural.
+    Judged by its vertical strokes: a flat has one stem rising well above its bowl; a sharp
+    has two reaching above and below; a natural two, the left one higher."""
+    x, y, w, h = low.box
+    il = h  # a notehead is about one staff space tall
+    x0, x1 = max(int(x - 0.4 * il), 0), high.box[0] - 2
+    y0, y1 = max(int(y - 2.5 * il), 0), int(y + h + 1.5 * il)
+    win = page[y0:y1, x0:x1] < 128
+    if win.size == 0:
+        return None
+    win = ndimage.binary_closing(win, np.ones((5, 1)))  # bridge staff-line gaps in stems
+    strokes = []
+    for cx in range(win.shape[1]):
+        col = np.concatenate([[0], win[:, cx].astype(int), [0]])
+        e = np.flatnonzero(np.diff(col))
+        runs = list(zip(e[::2], e[1::2]))
+        top, bot = max(runs, key=lambda r: r[1] - r[0], default=(0, 0))
+        if bot - top >= 1.5 * il:
+            if strokes and strokes[-1][1] == cx - 1:
+                strokes[-1][1:] = [cx, min(strokes[-1][2], top), max(strokes[-1][3], bot)]
+            else:
+                strokes.append([cx, cx, top, bot])
+    head_top, head_bot = y - y0, y + h - y0
+    if len(strokes) == 1:
+        _, _, top, bot = strokes[0]
+        if top < head_top - 0.8 * il and abs(bot - head_bot) < 0.6 * il:
+            return "flat"
+    if len(strokes) == 2:
+        (_, _, t1, b1), (_, _, t2, b2) = strokes
+        if t1 < head_top and t2 < head_top and b1 > head_bot and b2 > head_bot and abs(t1 - t2) < 0.4 * il:
+            return "sharp"
+        if t1 < t2 - 0.4 * il and b2 > b1 + 0.4 * il:
+            return "natural"
+    return None
+
+
+def _fix_glued_accidentals(score: ET.Element, book: Book) -> set[int]:
+    """Audiveris sometimes reads an accidental touching its note as a second notehead
+    (D-flat -> a C+D chord). Such a 'head' has a very low grade and hugs a confident head
+    on the same or next staff step. Returns the ids of heads explained this way."""
+    used = set()
+    parts = score.findall("part")
+    for low in book.heads:
+        if low.grade >= 0.3:
+            continue
+        x, y, w, h = low.box
+        high = next((r for r in book.heads if r.sheet == low.sheet and r.part == low.part
+                     and r.staff == low.staff and r.measure == low.measure and r.grade >= 0.4
+                     and abs(r.pitch - low.pitch) <= 1 and 0 < r.box[0] - x <= 1.6 * w
+                     and abs(r.box[1] - y) < h), None)
+        if high is None or low.part >= len(parts):
+            continue
+        acc = _accidental_glyph(book.pages[low.sheet - 1], low, high)
+        part = parts[low.part]
+        measures = part.findall("measure")
+        if acc is None or low.measure >= len(measures):
+            continue
+        middle = _clef_steps(part, low.measure).get(low.staff)
+        if middle is None:
+            continue
+        m = measures[low.measure]
+        on_staff = [n for n in m.findall("note") if int(n.findtext("staff", "1")) == low.staff]
+        ln = next((n for n in on_staff if _step_number(n) == middle - low.pitch), None)
+        hn = next((n for n in on_staff if _step_number(n) == middle - high.pitch and n is not ln), None)
+        if ln is None or hn is None:
+            continue
+        head = ln if ln.find("chord") is None else hn if hn.find("chord") is None else None
+        chord = _chord_of(m, head) if head is not None else []
+        if ln not in chord or hn not in chord:
+            continue  # not one chord: leave it alone
+        if ln is head:  # keep the element carrying beams/lyrics; give it the real pitch
+            old = ln.find("pitch")
+            idx = list(ln).index(old)
+            ln.remove(old)
+            ln.insert(idx, hn.find("pitch"))
+            m.remove(hn)
+            keep = ln
+        else:
+            m.remove(ln)
+            keep = hn
+        pitch = keep.find("pitch")
+        for al in pitch.findall("alter"):
+            pitch.remove(al)
+        alter = {"flat": -1, "sharp": 1, "natural": 0}[acc]
+        if alter:
+            al = ET.Element("alter")
+            al.text = str(alter)
+            pitch.insert(1, al)
+        for old in keep.findall("accidental"):
+            keep.remove(old)
+        el = ET.Element("accidental")
+        el.text = acc
+        _insert_after(keep, el, ("type", "dot"))
+        used.add(id(low))
+    return used
+
+
+def _unsure_measures(book: Book, explained: set[int]) -> set[tuple[int, int]]:
+    """(part, measure) pairs where Audiveris itself doubted many of the noteheads."""
+    stats: dict[tuple[int, int], list[int]] = {}
+    for hd in book.heads:
+        if id(hd) in explained:
+            continue
+        s = stats.setdefault((hd.part, hd.measure), [0, 0])
+        s[0] += 1
+        s[1] += hd.grade < LOW_GRADE
+    return {k for k, (n, low) in stats.items() if low >= 2 and low >= 0.3 * n}
+
+
 # ------------------------------------------------------------------ flagging
 
-def _flag(m: ET.Element, expected: int) -> bool:
-    """Color every note of a measure whose voices don't fill the time signature."""
-    if m.get("implicit") == "yes":
+def _flag(m: ET.Element, expected: int, unsure: bool = False) -> bool:
+    """Color every note of a measure whose voices don't fill the time signature,
+    or whose noteheads Audiveris itself was unsure of."""
+    if m.get("implicit") == "yes" and not unsure:
         return False
-    bad = any(_voice_end(notes) != expected for notes in _voices(m).values())
+    bad = unsure or any(_voice_end(notes) != expected for notes in _voices(m).values())
     if bad:
         for n in m.iter("note"):
             n.set("color", FLAG_COLOR)
@@ -240,42 +473,57 @@ def _drop_text_dynamics(score: ET.Element):
                     m.remove(d)
 
 
+DYNAMICS = {"DYNAMICS_" + k.upper(): k for k in ("p", "pp", "ppp", "mp", "mf", "f", "ff", "fff", "sf", "sfz", "fp", "rf", "rfz", "fz", "sfp")}
+
+
+def _inside(inner: tuple, outer: tuple, slack: int = 3) -> bool:
+    cx, cy = inner[0] + inner[2] / 2, inner[1] + inner[3] / 2
+    return (outer[0] - slack <= cx <= outer[0] + outer[2] + slack
+            and outer[1] - slack <= cy <= outer[1] + outer[3] + slack)
+
+
+def _drop_symbols_in_text(score: ET.Element, book: Book):
+    """A dynamics sign Audiveris found inside a line of text is a letter of that text
+    (the "p" in "Play 3 times ad lib.")."""
+    parts = score.findall("part")
+    for d in book.dynamics:
+        if d.measure is None or not any(t.sheet == d.sheet and _inside(d.box, t.box) for t in book.texts):
+            continue
+        for part in [parts[d.part]] if d.part is not None and d.part < len(parts) else parts:
+            measures = part.findall("measure")
+            if d.measure >= len(measures):
+                continue
+            m = measures[d.measure]
+            hit = next((el for el in m.findall("direction") if el.find(".//dynamics") is not None
+                        and any(c.tag == DYNAMICS.get(d.kind) for c in el.find(".//dynamics"))), None)
+            if hit is not None:
+                m.remove(hit)
+                break
+
+
+def _reread_directions(score: ET.Element, book: Book):
+    """Read text directions ("Play 3 times ad lib.") again with the accurate OCR model:
+    Audiveris' reading loses words when it mistakes some for symbols."""
+    parts = score.findall("part")
+    for pi, part in enumerate(parts):
+        for mi, m in enumerate(part.findall("measure")):
+            for w in m.iter("words"):
+                old = (w.text or "").strip()
+                if len(old) < 3:
+                    continue
+                marks = [t for t in book.texts if t.measure == mi and t.part == pi and t.text]
+                best = max(marks, key=lambda t: difflib.SequenceMatcher(None, t.text, old).ratio(), default=None)
+                if best is None or difflib.SequenceMatcher(None, best.text, old).ratio() < 0.6:
+                    continue
+                new = lyrics.ocr_box(book, best.sheet, best.box)
+                if (len(new.split()) >= len(old.split())
+                        and difflib.SequenceMatcher(None, new.lower(), old.lower()).ratio() >= 0.6):
+                    w.text = new
+
+
 def _is_chordlike(text: str) -> bool:
     t = text.strip()
     return bool(re.fullmatch(r"N\.?C\.?", t) or CHORD_RE.match(t))
-
-
-def _fix_extenders(score: ET.Element, book: Book):
-    """Audiveris files the "___" after a held syllable as a hyphen. Re-read which
-    connector follows each syllable from its geometry and fix <syllabic>."""
-    seq = []  # (text, followed_by_extender) in reading order
-    by_line: dict[tuple, list] = {}
-    for li in book.lyrics:
-        il = book.systems[li.system].interline if 0 <= li.system < len(book.systems) else 20
-        by_line.setdefault((li.sheet, li.system, round(li.y / il)), []).append(li)
-    for key in sorted(by_line):
-        items = sorted(by_line[key], key=lambda li: li.x)
-        for i, li in enumerate(items):
-            if li.kind == "Syllable":
-                nxt = items[i + 1] if i + 1 < len(items) else None
-                seq.append((li.value, nxt is not None and nxt.kind != "Syllable" and "_" in nxt.value))
-    lyrics = [ly for part in score.findall("part") for ly in part.iter("lyric") if ly.find("text") is not None]
-    a = [unicodedata.normalize("NFKC", ly.findtext("text")) for ly in lyrics]
-    b = [t for t, _ in seq]
-    sm = difflib.SequenceMatcher(None, a, b, autojunk=False)
-    for blk in sm.get_matching_blocks():
-        for k in range(blk.size):
-            ly, (_, ext) = lyrics[blk.a + k], seq[blk.b + k]
-            syl = ly.find("syllabic")
-            if not ext or syl is None or syl.text not in ("begin", "middle"):
-                continue
-            syl.text = "single" if syl.text == "begin" else "end"
-            if ly.find("extend") is None:
-                ly.insert(list(ly).index(ly.find("text")) + 1, ET.Element("extend"))
-            if blk.a + k + 1 < len(lyrics):
-                nsyl = lyrics[blk.a + k + 1].find("syllabic")
-                if nsyl is not None and nsyl.text in ("end", "middle"):
-                    nsyl.text = "single" if nsyl.text == "end" else "begin"
 
 
 # ------------------------------------------------------------------ harmony
