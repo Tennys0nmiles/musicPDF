@@ -1,5 +1,5 @@
 """Run Audiveris on cleaned page images and read back its geometry (.omr book)."""
-import subprocess, unicodedata, zipfile
+import re, subprocess, unicodedata, zipfile
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 from fractions import Fraction
@@ -13,6 +13,8 @@ from clean import erase_fretboards
 HERE = Path(__file__).resolve().parent
 AUDIVERIS = HERE / "vendor/audiveris/opt/audiveris/bin/Audiveris"
 DPI = 300
+STEPS = 20  # Audiveris logs 20 steps per page (LOAD ... PAGE)
+STEP_LINE = re.compile(r"\[\w+#(\d+)\]\s+StepMonitoring\b.*\|\s*([A-Z_]+)\s*$")
 
 
 @dataclass
@@ -56,17 +58,31 @@ class Book:
 
 
 def rasterize(pdf: Path, workdir: Path) -> list[np.ndarray]:
-    subprocess.run(["pdftoppm", "-r", str(DPI), "-gray", "-png", str(pdf), str(workdir / "page")], check=True)
+    r = subprocess.run(["pdftoppm", "-r", str(DPI), "-gray", "-png", str(pdf), str(workdir / "page")],
+                       capture_output=True, text=True)
+    if r.returncode:
+        raise RuntimeError("couldn't open that file as a PDF")
     return [np.array(Image.open(p).convert("L")) for p in sorted(workdir.glob("page-*.png"))]
 
 
-def run(pdf: Path, workdir: Path) -> Book:
+def run(pdf: Path, workdir: Path, progress=None) -> Book:
+    """`progress(fraction, message)` is called as Audiveris works through the pages."""
     pages = [erase_fretboards(g, DPI)[0] for g in rasterize(pdf, workdir)]
     tif = workdir / "score.tif"
     imgs = [Image.fromarray(p).convert("1") for p in pages]
     imgs[0].save(tif, save_all=True, append_images=imgs[1:], compression="group4", dpi=(DPI, DPI))
-    subprocess.run([str(AUDIVERIS), "-batch", "-export", "-output", str(workdir), "--", str(tif)],
-                   check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    proc = subprocess.Popen([str(AUDIVERIS), "-batch", "-export", "-output", str(workdir), "--", str(tif)],
+                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, errors="replace")
+    done: dict[int, int] = {}  # page -> steps finished
+    for line in proc.stdout:
+        m = STEP_LINE.search(line)
+        if m and progress:
+            page = int(m.group(1))
+            done[page] = done.get(page, 0) + 1
+            progress(min(sum(done.values()) / (STEPS * len(pages)), 1.0),
+                     f"Reading the music: page {page} of {len(pages)}")
+    if proc.wait():
+        raise RuntimeError(f"Audiveris failed (exit code {proc.returncode})")
     if not (workdir / "score.mxl").exists():
         raise RuntimeError("Audiveris found no music in the PDF")
     return load(workdir / "score.mxl", workdir / "score.omr", pages)

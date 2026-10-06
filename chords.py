@@ -6,7 +6,7 @@ size, OCR each word with Tesseract, and keep only words that parse as chords.
 """
 import os, re, subprocess, tempfile
 from collections import Counter
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from fractions import Fraction
 from pathlib import Path
@@ -271,13 +271,18 @@ def _to_time(word: _Word) -> tuple[int, Fraction]:
     return st.measure, off
 
 
-def _read_words(book: Book) -> list[_Word]:
+def _read_words(book: Book, progress=None) -> list[_Word]:
     words, prev = [], None
     for system in book.systems:
         words += _words(book.pages[system.sheet - 1], system, prev)
         prev = system
-    with tempfile.TemporaryDirectory() as tmp, ThreadPoolExecutor(min(os.cpu_count() or 4, 4)) as ex:  # each Tesseract ~100 MB
-        list(ex.map(lambda nw: _ocr(nw[1], Path(tmp), nw[0]), enumerate(words)))
+    # 8 workers: each Tesseract peaks around 80 MB, so this stays well under 1 GB.
+    with tempfile.TemporaryDirectory() as tmp, ThreadPoolExecutor(min(os.cpu_count() or 4, 8)) as ex:
+        futures = [ex.submit(_ocr, w, Path(tmp), i) for i, w in enumerate(words)]
+        for k, f in enumerate(as_completed(futures), 1):
+            f.result()
+            if progress:
+                progress(k / len(futures), f"Reading chord names: {k} of {len(futures)}")
     return words
 
 
@@ -326,8 +331,8 @@ def _vote(words: list[_Word], book: Book) -> dict[int, str]:
     return labels
 
 
-def detect(book: Book) -> list[Chord]:
-    words = _read_words(book)
+def detect(book: Book, progress=None) -> list[Chord]:
+    words = _read_words(book, progress)
     labels = _vote(words, book)
     chords = []
     for system in book.systems:

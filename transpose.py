@@ -10,7 +10,7 @@ Bars whose rhythm still doesn't add up after repair are printed in red and liste
   ./transpose.py song.pdf -2 -o out.pdf
   ./transpose.py --serve             # web UI at http://localhost:8771
 """
-import argparse, base64, json, os, secrets, subprocess, sys, tempfile, time
+import argparse, base64, json, os, secrets, shutil, subprocess, sys, tempfile, threading, time
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -66,24 +66,35 @@ def musescore(xml: Path, semitones: int, out: Path) -> tuple[bytes, bytes]:
     return base64.b64decode(data["pdf"]), base64.b64decode(data["mscz"])
 
 
-def transpose(src: Path, semitones: int, log=print) -> Result:
+# Share of the whole run each stage takes (measured on an 8-page scanned song).
+STAGES = {"prepare": (0.00, 0.03), "omr": (0.03, 0.78), "chords": (0.78, 0.94), "engrave": (0.94, 1.00)}
+
+
+def transpose(src: Path, semitones: int, progress=None) -> Result:
+    """`progress(fraction, message)` reports how far along the whole run is (0..1)."""
     if not -12 <= semitones <= 12:
         raise ValueError("semitones must be between -12 and 12")
+
+    def stage(name):
+        lo, hi = STAGES[name]
+        return lambda f, msg: progress and progress(lo + (hi - lo) * f, msg)
+
     with tempfile.TemporaryDirectory() as tmp:
         tmp = Path(tmp)
         if src.suffix.lower() in (".mxl", ".musicxml", ".xml"):
             xml, flagged, n = src, [], 0
         else:
-            t = time.time()
-            log("Reading the music (Audiveris)...")
-            book = omr.run(src, tmp)
-            log(f"  {len(book.pages)} pages in {time.time() - t:.0f}s. Reading chord symbols...")
-            found = chords.detect(book)
+            stage("prepare")(0, "Preparing the pages")
+            book = omr.run(src, tmp, stage("omr"))
+            stage("chords")(0, "Reading chord names")
+            found = chords.detect(book, stage("chords"))
             tree, flagged = fixup.fix(book, found)
             xml, n = tmp / "score.musicxml", len(found)
             tree.write(xml, encoding="UTF-8", xml_declaration=True)
-        log("Engraving (MuseScore)...")
+        stage("engrave")(0, "Transposing and engraving (MuseScore)")
         pdf, mscz = musescore(xml, semitones, tmp)
+    if progress:
+        progress(1.0, "Done")
     return Result(pdf, mscz, flagged, n)
 
 
@@ -91,25 +102,77 @@ def transpose(src: Path, semitones: int, log=print) -> Result:
 
 PAGE = """<!doctype html><meta charset=utf-8><meta name=viewport content="width=device-width">
 <title>Transposer</title>
-<style>body{font:16px system-ui;max-width:32rem;margin:3rem auto;padding:0 1rem;line-height:1.5}
+<style>
+:root{--fg:#1d1d1f;--muted:#5f6368;--track:#e8eaed;--fill:#1a73e8;--warn:#b3261e;--bg:#fff}
+@media (prefers-color-scheme:dark){:root{--fg:#e8eaed;--muted:#9aa0a6;--track:#3c4043;--fill:#8ab4f8;--warn:#f28b82;--bg:#202124}}
+body{font:16px system-ui;max-width:32rem;margin:3rem auto;padding:0 1rem;line-height:1.5;color:var(--fg);background:var(--bg)}
 input,button{font:inherit;margin:.4rem 0;display:block}button{padding:.5rem 1rem}
-.note{color:#555;font-size:.9rem}.warn{color:#b3261e}</style>
+.note,#msg{color:var(--muted);font-size:.9rem}.warn{color:var(--warn)}
+.bar{height:14px;background:var(--track);border-radius:7px;overflow:hidden;margin:1.2rem 0 .4rem}
+#fill{height:100%;width:0;background:var(--fill);transition:width .6s ease}
+#pct{font-variant-numeric:tabular-nums;font-weight:600}
+</style>
 <h2>Transpose sheet music</h2>
-%s
-<form method=post enctype=multipart/form-data action=/transpose onsubmit="b.disabled=true;b.textContent='Working... (about 20 s per page)'">
+<form id=f>
 <label>PDF (or MusicXML)<input type=file name=file accept=".pdf,.mxl,.musicxml,.xml" required></label>
 <label>Semitones (+ up, &minus; down)<input type=number name=semitones value=0 min=-12 max=12></label>
 <button id=b>Transpose</button></form>
+<div id=prog hidden><div class=bar><div id=fill></div></div><span id=pct>0%</span> <span id=msg></span></div>
+<div id=out></div>
 <p class=note>The music is read from the page, so check the result. Bars the reader
-was unsure of are printed in <span class=warn>red</span>; fix them in the MuseScore file if needed.</p>"""
+was unsure of are printed in <span class=warn>red</span>; fix them in the MuseScore file if needed.</p>
+<script>
+const $ = id => document.getElementById(id);
+const esc = s => s.replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+function left(sec) { return sec < 60 ? 'under a minute left' : 'about ' + Math.round(sec / 60) + ' min left'; }
+$('f').onsubmit = async e => {
+  e.preventDefault();
+  $('b').disabled = true; $('prog').hidden = false; $('out').innerHTML = '';
+  $('fill').style.width = '0'; $('pct').textContent = '0%'; $('msg').textContent = 'Uploading';
+  let job;
+  try { job = (await (await fetch('/transpose', {method: 'POST', body: new FormData($('f'))})).json()).job; }
+  catch (err) { $('out').innerHTML = '<p class=warn>Upload failed: ' + esc(String(err)) + '</p>'; $('b').disabled = false; return; }
+  const t0 = Date.now();
+  const poll = async () => {
+    let s;
+    try { s = await (await fetch('/status/' + job)).json(); } catch { return setTimeout(poll, 2000); }
+    const pct = Math.floor(s.pct * 100), sec = (Date.now() - t0) / 1000;
+    $('fill').style.width = (s.pct * 100).toFixed(1) + '%';
+    $('pct').textContent = pct + '%';
+    $('msg').textContent = s.msg + (s.pct > 0.08 && !s.done ? ' \u00b7 ' + left(sec * (1 - s.pct) / s.pct) : '');
+    if (s.error) {
+      $('out').innerHTML = '<p class=warn>Failed: ' + esc(s.error) + '</p>'; $('b').disabled = false;
+    } else if (s.done) {
+      const bars = s.flagged.length ? '<p class=warn>Check bar' + (s.flagged.length > 1 ? 's ' : ' ') + s.flagged.join(', ') + ' (in red).</p>' : '';
+      $('out').innerHTML = '<p><b>Done</b> in ' + Math.round(sec) + ' s: ' + esc(s.name) + ', ' + s.chords + ' chord symbols.</p>' + bars +
+        '<p><a href="/' + job + '/pdf" target=_blank>Open transposed PDF</a> &middot; <a href="/' + job + '/mscz">MuseScore file</a></p>';
+      $('b').disabled = false;
+    } else setTimeout(poll, 1000);
+  };
+  poll();
+};
+</script>"""
 
 
 def serve(port: int):
     from email.parser import BytesParser
     from email.policy import HTTP
-    from html import escape
     from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-    results: dict[str, tuple[str, Result]] = {}
+    jobs: dict[str, dict] = {}
+    one_at_a_time = threading.Lock()  # a run is a heavy job; never stack two
+
+    def run(job: dict, src: Path, n: int):
+        def progress(f, msg):
+            job.update(pct=f, msg=msg)
+        try:
+            job["msg"] = "Waiting for the previous run to finish"
+            with one_at_a_time:
+                job["result"] = transpose(src, n, progress)
+        except Exception as e:  # shown on the page
+            job["error"] = str(e) or type(e).__name__
+        finally:
+            shutil.rmtree(src.parent, ignore_errors=True)
+            job["done"] = True
 
     class H(BaseHTTPRequestHandler):
         def _send(self, body: bytes, ctype: str, extra=()):
@@ -122,13 +185,21 @@ def serve(port: int):
 
         def do_GET(self):
             path = self.path.strip("/").split("/")
-            if len(path) == 2 and path[0] in results and path[1] in ("pdf", "mscz"):
-                name, r = results[path[0]]
+            if len(path) == 2 and path[0] == "status" and path[1] in jobs:
+                j = jobs[path[1]]
+                r = j.get("result")
+                status = {k: j[k] for k in ("pct", "msg", "name")} | {
+                    "done": j["done"] and r is not None, "error": j.get("error"),
+                    "flagged": r.flagged if r else [], "chords": r.chords if r else 0}
+                self._send(json.dumps(status).encode(), "application/json")
+            elif len(path) == 2 and path[0] in jobs and path[1] in ("pdf", "mscz") and jobs[path[0]].get("result"):
+                j = jobs[path[0]]
                 ctype = "application/pdf" if path[1] == "pdf" else "application/octet-stream"
                 disp = "inline" if path[1] == "pdf" else "attachment"
-                self._send(getattr(r, path[1]), ctype, [("Content-Disposition", f'{disp}; filename="{name}.{path[1]}"')])
+                self._send(getattr(j["result"], path[1]), ctype,
+                           [("Content-Disposition", f'{disp}; filename="{j["name"]}.{path[1]}"')])
             else:
-                self._send((PAGE % "").encode(), "text/html")
+                self._send(PAGE.encode(), "text/html")
 
         def do_POST(self):
             body = self.rfile.read(int(self.headers["Content-Length"]))
@@ -137,25 +208,29 @@ def serve(port: int):
             fields = {p.get_param("name", header="content-disposition"): p for p in msg.iter_parts()}
             f, n = fields["file"], int(fields["semitones"].get_content().strip() or 0)
             name = Path(f.get_filename() or "score.pdf")
-            try:
-                with tempfile.TemporaryDirectory() as tmp:
-                    src = Path(tmp) / f"in{name.suffix.lower()}"
-                    src.write_bytes(f.get_payload(decode=True))
-                    r = transpose(src, n)
-            except Exception as e:
-                self._send((PAGE % f"<p class=warn>Failed: {escape(str(e))}</p>").encode(), "text/html")
-                return
+            src = Path(tempfile.mkdtemp(prefix="transposer-")) / f"in{name.suffix.lower()}"
+            src.write_bytes(f.get_payload(decode=True))
             token = secrets.token_urlsafe(8)
-            results[token] = (f"{name.stem}_{n:+d}", r)
-            bars = (f"<p class=warn>Check bar{'s' if len(r.flagged) > 1 else ''} "
-                    f"{', '.join(map(str, r.flagged))} (in red).</p>") if r.flagged else ""
-            done = (f"<p><b>Done:</b> {escape(name.name)} {n:+d} semitones, {r.chords} chord symbols.</p>{bars}"
-                    f"<p><a href=/{token}/pdf target=_blank>Open transposed PDF</a> &middot; "
-                    f"<a href=/{token}/mscz>MuseScore file</a></p><hr>")
-            self._send((PAGE % done).encode(), "text/html")
+            jobs[token] = {"pct": 0.0, "msg": "Starting", "name": f"{name.stem}_{n:+d}", "done": False}
+            threading.Thread(target=run, args=(jobs[token], src, n), daemon=True).start()
+            self._send(json.dumps({"job": token}).encode(), "application/json")
+
+        def log_message(self, fmt, *args):
+            if not self.path.startswith("/status/"):  # the page polls every second
+                super().log_message(fmt, *args)
 
     print(f"http://localhost:{port}")
     ThreadingHTTPServer(("127.0.0.1", port), H).serve_forever()
+
+
+def text_bar(f: float, msg: str):
+    """One self-updating progress line for the terminal."""
+    width = 30
+    filled = int(f * width)
+    sys.stderr.write(f"\r[{'#' * filled}{'-' * (width - filled)}] {f * 100:3.0f}%  {msg[:60]:<60}")
+    if f >= 1:
+        sys.stderr.write("\n")
+    sys.stderr.flush()
 
 
 if __name__ == "__main__":
@@ -172,7 +247,7 @@ if __name__ == "__main__":
         ap.error("give an input file or --serve")
     else:
         out = a.output or a.input.with_name(f"{a.input.stem}_{a.semitones:+d}.pdf")
-        r = transpose(a.input, a.semitones)
+        r = transpose(a.input, a.semitones, text_bar)
         out.parent.mkdir(parents=True, exist_ok=True)
         out.write_bytes(r.pdf)
         out.with_suffix(".mscz").write_bytes(r.mscz)
